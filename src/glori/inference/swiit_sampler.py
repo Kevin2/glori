@@ -550,6 +550,8 @@ class SWIITSampler:
         drop_inpainting_ctxt_at=-1,
         use_inpainting_replacement=True,
         timesteps=25,
+        do_inpainting=True,
+        do_blended_decoding=True,
         **dm_sampling_kw,
     ):
 
@@ -615,7 +617,7 @@ class SWIITSampler:
 
         # Info message
         self.logger.info(
-            f"Sampling {sampling_steps[0]}x{sampling_steps[1]} steps "
+            f"Sampling {height_steps}x{width_steps} steps "
             f"with latent size {self.config.latent_size} and image size {self.config.image_size}"
         )
 
@@ -669,6 +671,12 @@ class SWIITSampler:
         pbar = tqdm(
             total=total_steps_sample, desc="Sampling Latent Map", dynamic_ncols=True
         )
+
+        if not do_inpainting:
+            self.logger.info(
+                "Inpainting is disabled, the entire latent map will be sampled without context."
+            )
+            drop_inpainting_ctxt_at = timesteps
 
         # Start DM sampling loop
         for step, (row, col) in enumerate(
@@ -807,7 +815,13 @@ class SWIITSampler:
             sampled_image_step[:, slc_row_img, slc_col_img] = sampled_image
 
             # Add the sampled image to the map image thorugh blending
-            blend_patch, blend_inv_patch = self.blend_for_decoding_iteration(row, col)
+            if do_blended_decoding:
+                blend_patch, blend_inv_patch = self.blend_for_decoding_iteration(
+                    row, col
+                )
+            else:
+                blend_patch = torch.ones((self.config.image_size,) * 2)
+                blend_inv_patch = torch.zeros((self.config.image_size,) * 2)
 
             # Blend patch has size of image, blend has size of map
             blend_sampled_step = torch.ones_like(map_image)

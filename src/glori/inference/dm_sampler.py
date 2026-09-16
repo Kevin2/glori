@@ -269,6 +269,9 @@ class DMSampler:
         - The output images are scaled from the range [-1, 1] to [0, 1].
 
         """
+        # Update settiongs with user input
+        self.settings.update(settings_kwargs)
+
         # Set logging level
         if quiet:
             self.logger.setLevel(30)

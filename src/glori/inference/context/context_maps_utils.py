@@ -128,7 +128,7 @@ def _enforce_ranges(
     inputs=(None, None, None),
 ):
     if all(r is None for r in ranges):
-        return countsdd, bins_list, inputs
+        return countsdd, bins_list, inputs, ranges
 
     inputs_enf = list(inputs)
     ranges_enf = list(ranges)
@@ -177,6 +177,8 @@ def _enforce_ranges(
         # Explanation of +2: upper slice limit is exclusive (+1),
         # and we need to include the upper edge of the last valid bin (+1),
         bins_list[i] = bins_list[i][valid_idxs[0] : valid_idxs[-1] + 2]
+
+    print(f"Enforced ranges: {ranges}, resulting counts shape: {countsdd.shape}")
     return countsdd, bins_list, inputs, ranges
 
 
@@ -209,6 +211,10 @@ def sample_histdd_marginal(
     inputs=(None, None, None),
     ranges=(None, None, None),
 ):
+    # Bins needs to be a list of 3 arrays
+    if isinstance(bins_list, np.ndarray):
+        bins_list = [b for b in bins_list]
+
     n_samples = _validate_inputs(countsdd, bins_list, inputs)
 
     countsdd, bins_list, inputs, ranges = _enforce_ranges(
@@ -247,9 +253,7 @@ def sample_histdd_marginal(
         zero_flag := marginal_counts.sum(axis=tuple(range(1, marginal_counts.ndim)))
         == 0
     ).any():
-        raise ValueError(
-            f"No samples available for input combinations."
-        )
+        raise ValueError(f"No samples available for input combinations.")
 
     samples = _histdd_marginal_loop(
         marginal_counts,
@@ -267,6 +271,10 @@ def sample_histdd(
     inputs=(None, None, None),
     ranges=(None, None, None),
 ):
+    # Bins needs to be a list of 3 arrays
+    if isinstance(bins_list, np.ndarray):
+        bins_list = [b for b in bins_list]
+
     n_samples_inferred = _validate_inputs(countsdd, bins_list, inputs, n_samples)
 
     countsdd, bins_list, inputs, ranges = _enforce_ranges(
