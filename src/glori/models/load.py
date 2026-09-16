@@ -87,6 +87,9 @@ def parse_lightning_ckpt(
         case str():
             ckpt_path = model_parent / "lightning" / ckpt
 
+        case Path():
+            ckpt_path = ckpt
+
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint {ckpt_path} does not exist.")
 
@@ -187,9 +190,10 @@ def load_model(
         If the specified snapshot file is not found.
 
     """
-    raise NotImplementedError(
-        "The function load_model() is deprecated. Use model.load() instead."
-    )
+    # Deferred import: glori.models.networks.unet -> ...modules -> glori.models.load
+    # forms a circular import if done at module level, since modules.py imports
+    # parse_lightning_ckpt from this file.
+    import glori.models.networks.unet as unet
 
     # Parse model specifier
     _, model_dir, model_file, config_file = parse_model_specifier(source)
@@ -197,16 +201,15 @@ def load_model(
     # Load config and construct model
     logger.info(f"Loading model from {config_file}")
 
-    # Removed on 26.02.26 to prevent circular import.
-    # config = modelConfig.from_preset(config_file)
-    # model = unet.EDMPrecond.from_config(config)
+    config = modelConfig.from_preset(config_file)
+    model = unet.EDMPrecond.from_config(config)
 
     # Load model weights
     if load_weights:
 
         # Load snapshot, if specified
         if snapshot_iter is not None:
-            snapshot_file = model_dir / f"snapshots/snapshot_iter_{iter:08d}.pt"
+            snapshot_file = model_dir / f"snapshots/snapshot_iter_{snapshot_iter:08d}.pt"
             if not snapshot_file.exists():
                 raise FileNotFoundError(f"Snapshot file {snapshot_file} not found.")
             logger.info(f"Loading snapshot from {snapshot_file}")
@@ -257,7 +260,29 @@ def load_parameters(
         }
 
     # Load weights into model
-    model.load_state_dict(state_dict)
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as e:
+        # Some older checkpoints predate a module-renaming refactor (e.g. Sequential
+        # indices like "in_layers.0" -> named submodules like "in_layers.group_norm")
+        # but are otherwise architecturally identical. If the number of parameter
+        # tensors and their shapes match exactly in registration order, it's safe to
+        # remap positionally rather than by name.
+        target_sd = model.state_dict()
+        same_shapes_in_order = [tuple(v.shape) for v in state_dict.values()] == [
+            tuple(v.shape) for v in target_sd.values()
+        ]
+        if len(state_dict) == len(target_sd) and same_shapes_in_order:
+            logger.warning(
+                "Checkpoint keys don't match the current model's naming (likely an "
+                "older checkpoint predating a module-renaming refactor). Parameter "
+                "count and shapes match exactly in registration order, so remapping "
+                f"positionally instead. Original error:\n{e}"
+            )
+            state_dict = dict(zip(target_sd.keys(), state_dict.values()))
+            model.load_state_dict(state_dict)
+        else:
+            raise
 
     return model
 
