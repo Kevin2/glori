@@ -108,8 +108,8 @@ LOTSS_DR2_CAT = LOFAR_DATA_PARENT / "LoTSS_DR2_v110_masked.srl.fits"
 LOTSS_DR3_CAT = LOFAR_DATA_PARENT / "LoTSS_DR3_v0.5.srl.parquet"
 
 # Paths for map simulation files
-MAP_SHELL_SCRIPTS = BASE_PARENT / "src/maps/shell_scripts"
-MAP_DEFAULTS = BASE_PARENT / "src/maps/default_files"
+MAP_SHELL_SCRIPTS = BASE_PARENT / "src/glori/maps/shell_scripts"
+MAP_DEFAULTS = BASE_PARENT / "src/glori/maps/default_files"
 
 
 def cast_to_Path(path):
