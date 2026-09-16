@@ -18,6 +18,21 @@ else:
 logger = glori.infra.logging.get_logger(__name__)
 
 
+def _resolve_in_channels(model):
+    """
+    Get the number of input channels a denoiser model expects.
+
+    `Denoiser` (used by the modern LDM/SWIIT pipeline) exposes this directly as
+    `.in_channels`. Raw `EDMPrecond`-wrapped models (used by the legacy
+    `MapMaker` extended-source sampling) don't, so fall back to the inner
+    wrapped model's `.input_channels`.
+    """
+    in_channels = getattr(model, "in_channels", None)
+    if in_channels is not None:
+        return in_channels
+    return getattr(model, "model", model).input_channels
+
+
 @torch.no_grad()
 def edm_sampling(
     model,
@@ -181,9 +196,9 @@ def edm_sampling(
             image_channels
             if image_channels is not None
             else (
-                int(model.in_channels - img_context_batch.shape[1])
+                int(_resolve_in_channels(model) - img_context_batch.shape[1])
                 if img_context_batch is not None
-                else model.in_channels
+                else _resolve_in_channels(model)
             )
         )
         assert (
@@ -201,9 +216,9 @@ def edm_sampling(
     else:
         if image_channels is None:
             image_channels = (
-                int(model.in_channels - img_context_batch.shape[1])
+                int(_resolve_in_channels(model) - img_context_batch.shape[1])
                 if img_context_batch is not None
-                else model.in_channels
+                else _resolve_in_channels(model)
             )
         seed_noise = torch.randn(
             [
