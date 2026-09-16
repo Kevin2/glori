@@ -256,13 +256,17 @@ def double_map_plot(
         from astropy.visualization.wcsaxes import add_scalebar
 
         for ax in axs:
+
+            def fmt(x):
+                return f"{x:.1f}".rstrip("0").rstrip(".")
+
             label = (
-                f"{scalebar_size_arcsec} arcsec"
+                f"{fmt(scalebar_size_arcsec)} arcsec"
                 if scalebar_size_arcsec < 60
                 else (
-                    f"{scalebar_size_arcsec / 60:.1f} arcmin"
+                    f"{fmt(scalebar_size_arcsec / 60)} arcmin"
                     if scalebar_size_arcsec < 3600
-                    else f"{scalebar_size_arcsec / 3600:.1f} deg"
+                    else f"{fmt(scalebar_size_arcsec / 3600)} deg"
                 )
             )
             add_scalebar(
@@ -291,6 +295,7 @@ def double_map_plot(
         cbar_label=cbar_label1,
         norm=norm1,
         norm_quantile=norm_quantile,
+        scalebar=False,
         **kw_map1,
     )
     _, _, im2 = plot_sky_map(
@@ -301,17 +306,42 @@ def double_map_plot(
         cbar_label=cbar_label2,
         norm=norm2,
         norm_quantile=norm_quantile,
+        scalebar=False,
         **kw_map2,
     )
     axs[1].set_ylabel("")
 
     if single_cbar and colorbar:
-        # Add new subplot axis for colorbar
-        fig.subplots_adjust(right=0.85)
-        pos = axs[1].get_position()
-        cax = fig.add_axes(
-            [pos.x1 + 0.04, pos.y0, 0.03, pos.height]
-        )  # Position for the colorbar
-        fig.colorbar(im1, cax=cax)  # , fraction=0.046, pad=0.05)
+        # # Add new subplot axis for colorbar
+        # fig.set_layout_engine("none")
+        # fig.subplots_adjust(right=0.85)
+        # pos = axs[1].get_position()
+        # width = 0.015
+        # height_factor = 0.8
+        # cax = fig.add_axes(
+        #     [
+        #         pos.x1 + 0.04,
+        #         pos.y0 + (pos.height * (1 - height_factor)) / 2,
+        #         width,
+        #         pos.height * height_factor,
+        #     ]
+        # )  # Position for the colorbar
+        # fig.colorbar(im1, cax=cax, label=cbar_label1)  # , fraction=0.046, pad=0.05)
+
+        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+        height_factor = 0.9
+        padding_fraction = 0.1
+        cax = inset_axes(
+            axs[1],
+            width="3%",  # width relative to axs[1]
+            height=f"{height_factor * 100}%",  # height relative to axs[1]
+            loc="lower left",
+            bbox_to_anchor=(1 + padding_fraction, (1 - height_factor) / 2, 1, 1),
+            bbox_transform=axs[1].transAxes,
+            borderpad=0,
+        )
+        fig.colorbar(im1, cax=cax, label=cbar_label1)
+        fig.subplots_adjust(right=0.85)  # after colorbar, leave room on the right
 
     return fig, axs
