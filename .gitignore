@@ -26,3 +26,6 @@ __pycache__/
 
 # Setuptools build metadata
 *.egg-info/
+
+# PDFs
+*.pdf
