@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from torchvision.utils import make_grid
 from vqtorch.nn import VectorQuant
 
+import glori.infra.logging
 from glori.data.trf.scalers import LOFARScaler
 import glori.models.vae.vae_utils as vae_utils
 from glori.models.vae.vqvae_loss import VQLossWithDiscriminator
@@ -20,6 +21,8 @@ from glori.models.networks.modules import (
     zero_module,
 )
 from glori.models.networks.vae_modules import *
+
+logger = glori.infra.logging.get_logger(__name__)
 
 
 class VQVAE(configModuleBaseLightning):
@@ -178,7 +181,16 @@ class VQVAE(configModuleBaseLightning):
         )
 
         if scaler is not None:
-            self.scaler = LOFARScaler.load(scaler)
+            try:
+                self.scaler = LOFARScaler.load(scaler)
+            except FileNotFoundError as e:
+                logger.warning(
+                    f"Could not load named scaler {scaler!r} from local storage "
+                    f"({e}). Setting self.scaler = None -- assign it manually (e.g. "
+                    "from glori.hub.download_pretrained('scaler')) before calling "
+                    "anything that needs it."
+                )
+                self.scaler = None
         self.automatic_optimization = False
         self.train_mode = train_mode
         self.overfit_batch = overfit_batch

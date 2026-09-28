@@ -77,7 +77,16 @@ class SWIITSampler:
         self.sampler.logger.disabled = True  # Disable sampler logging
 
         # Load scaler
-        self.scaler = LOFARScaler.load(self.config.scaler)
+        try:
+            self.scaler = LOFARScaler.load(self.config.scaler)
+        except FileNotFoundError as e:
+            self.logger.warning(
+                f"Could not load named scaler {self.config.scaler!r} from local "
+                f"storage ({e}). Leaving self.scaler unset -- assign it manually "
+                "(e.g. from glori.hub.download_pretrained('scaler')) before "
+                "calling anything that needs it."
+            )
+            self.scaler = None
 
         self.logger.info("ICM Sampler initialized.")
 
