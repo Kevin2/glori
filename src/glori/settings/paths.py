@@ -20,8 +20,7 @@ IMG_DATA_PARENT_HOPPER = STORAE_PARENT_HOPPER / "image_data"
 
 # Cache directory
 CACHE_DIR = STORAGE_PARENT / ".cache"
-if not CACHE_DIR.exists():
-    CACHE_DIR.mkdir()
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Model configuration presets
 CONFIG_PARENT = BASE_PARENT / "configs"
@@ -37,14 +36,12 @@ LOFAR_DATA_PARENT = IMG_DATA_PARENT / "LOFAR"
 LOFAR_DATA_PARENT_HOPPER = IMG_DATA_PARENT_HOPPER / "LOFAR"
 FIRST_DATA_PARENT = IMG_DATA_PARENT / "FIRST"
 for f in [LOFAR_DATA_PARENT, FIRST_DATA_PARENT]:
-    if not f.exists():
-        f.mkdir()
+    f.mkdir(parents=True, exist_ok=True)
 SKY_MAP_PARENT = STORAGE_PARENT / "sky_maps"
 
 # Pretrained models
 PRETRAINED_PARENT = MODEL_PARENT / "pretrained"
-if not PRETRAINED_PARENT.exists():
-    PRETRAINED_PARENT.mkdir()
+PRETRAINED_PARENT.mkdir(parents=True, exist_ok=True)
 
 # Train data subsets
 LOFAR_SUBSETS = IndexedOrderedDict(
