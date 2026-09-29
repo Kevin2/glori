@@ -29,10 +29,10 @@ def match_sources(
 
     # Extract data from resample result
     logger.info("Extracting data from resample result...")
-    srls = (
+    srls_output = (
         resample_result["srls"]
-        if not use_original_bdsf_results
-        else [r["catalogs"]["srl"] for r in resample_result["orig_bdsf_results"]]
+        # if not use_original_bdsf_results
+        # else [r["catalogs"]["srl"] for r in resample_result["orig_bdsf_results"]]
     )
     wcs = resample_result["wcs"]
     pos_masks = resample_result.get("pos_masks", None)
@@ -57,13 +57,42 @@ def match_sources(
 
     # Loop through output source lists
     logger.info("Matching sources...")
-    for i in tqdm(range(len(srls)), total=len(srls)):
+    for i in tqdm(range(len(srls_output)), total=len(srls_output)):
 
         # Get output catalog for this image
-        srl = srls[i]
+        srl_output = srls_output[i]
+
+        # If we use the original bdsf results, we get the input catalog from those
+        if use_original_bdsf_results:
+            # Get original bdsf results for this image
+            orig_bdsf_result = resample_result["orig_bdsf_results"][i]
+
+            # If no sources are found in image, srl is None
+            if orig_bdsf_result["catalogs"]["srl"] is None:
+                # All input is unmatched
+                match_dict = {
+                    "matched_in": pd.DataFrame({}),
+                    "unmatched_in": pd.DataFrame({}),
+                    "matched_out": pd.DataFrame({}),
+                    "unmatched_out": pd.DataFrame({}),
+                }
+                match_dicts.append(match_dict)
+                all_inp.append(np.zeros((3, 0)))
+                all_outp.append(np.zeros((3, 0)))
+                all_d2d.append(np.array([]))
+                continue
+
+            # Get input catalog from original bdsf results
+            input_subcat = orig_bdsf_result["catalogs"]["srl"]
+            input_coords = SkyCoord(
+                ra=input_subcat["RA"], dec=input_subcat["DEC"], unit="deg"
+            )
+            inp_vals = np.array(
+                [input_subcat[col].values for col in ["Total_flux", "Peak_flux", "Maj"]]
+            )
 
         # if we have no position masks, we get the input catalog from the context map
-        if pos_masks is None:
+        elif pos_masks is None:
 
             # Get context map for this image
             ctxt = ctxt_map_exp[i]
@@ -105,7 +134,7 @@ def match_sources(
         )
 
         # If no sources are found in image, srl is None
-        if srl is None:
+        if srl_output is None:
             # All input is unmatched
             match_dict = {
                 "matched_in": pd.DataFrame({}),
@@ -120,7 +149,7 @@ def match_sources(
             continue
 
         # Define coordinates for output sources
-        srl_coords = SkyCoord(ra=srl["RA"], dec=srl["DEC"], unit="deg")
+        srl_coords = SkyCoord(ra=srl_output["RA"], dec=srl_output["DEC"], unit="deg")
 
         # idx are indices into input_coords that correspond to the
         # nearest neighbor of srl_coords (i.e. len(idx) = len(srl_coords))
@@ -136,8 +165,8 @@ def match_sources(
         match_dict = {
             "matched_in": input_subcat.iloc[unique_idx],
             "unmatched_in": input_subcat.drop(index=unique_idx),
-            "matched_out": srl.iloc[dist_mask],
-            "unmatched_out": srl.drop(index=np.where(dist_mask)[0]),
+            "matched_out": srl_output.iloc[dist_mask],
+            "unmatched_out": srl_output.drop(index=np.where(dist_mask)[0]),
         }
         match_dicts.append(match_dict)
 
@@ -149,7 +178,7 @@ def match_sources(
         # - Peak_flux uses the maximum
         # - Maj uses the maximum (this is crappy tho)
         for j, i in enumerate(unique_idx):
-            sub_srl = srl[idx == i]
+            sub_srl = srl_output[idx == i]
             out_vals[j] = [
                 sub_srl["Total_flux"].sum(),
                 sub_srl["Peak_flux"].max(),

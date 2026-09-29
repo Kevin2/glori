@@ -241,6 +241,11 @@ def reduce_context_map(
         for i, scaler in enumerate(scalers, start=1):
             arr_inv_sc[:, i] = scaler.inverse_scale(arr_inv_sc[:, i]) * arr_mask
 
+    # If positional mask is in [-1, 1], bring it to [0, 1]
+    positions_is_minus_1 = (arr_inv_sc[:, 0] < 0).any()
+    if positions_is_minus_1:
+        arr_inv_sc[:, 0] = (arr_inv_sc[:, 0] + 1) / 2
+
     # Reduce the array by summing f_downscale-neighboring pixels
     arr_red = reduce(
         arr_inv_sc,
@@ -264,6 +269,10 @@ def reduce_context_map(
             scaler.scale(arr_red[:, i]) if scale_output else arr_red[:, i],
             0,
         )
+
+    # Bring positional mask back to [-1, 1] if it was originally in that range
+    if positions_is_minus_1:
+        arr_red[:, 0] = arr_red[:, 0] * 2 - 1
 
     if ndim == 3:
         arr_red = arr_red.squeeze(0)
