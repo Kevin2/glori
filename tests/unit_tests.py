@@ -2,8 +2,6 @@ import os
 import sys
 import pytest
 
-import dependency_detective
-
 # Main folder is the pythonpath
 main_folder = os.path.join(os.path.dirname(__file__), "..", "src")
 if main_folder not in sys.path:
@@ -31,7 +29,10 @@ imports_to_test = list_python_modules(main_folder)
 def test_dynamic_imports(module):
     # Exclude modules that start with 'scripts.'
     excluded = ["archive."]
-    if any(module.startswith(prefix) for prefix in excluded):
+    # Legacy WSClean-based map simulation, needs the optional python-casacore
+    # package (not part of the base install) -- not used by any shipped tutorial.
+    excluded_modules = ["glori.maps.telsim_utils", "glori.maps.telescope_simulator"]
+    if any(module.startswith(prefix) for prefix in excluded) or module in excluded_modules:
         return
     try:
         __import__(module)
