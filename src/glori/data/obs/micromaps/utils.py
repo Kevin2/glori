@@ -150,8 +150,14 @@ def context_map_by_wcs(
     catalog,
     scalers=["ctxt_scaler_ftot", "ctxt_scaler_fpeak", "ctxt_scaler_maj"],
     scale_output=False,
+    qtys=("Total_flux", "Peak_flux", "Maj"),
 ):
     if scale_output:
+        if len(scalers) != len(qtys):
+            raise ValueError(
+                f"scale_output needs one scaler per quantity, got {len(scalers)} "
+                f"scalers for {len(qtys)} quantities {qtys}."
+            )
         if type(scalers[0]) is str:
             scalers = [ContextScaler.load(scaler) for scaler in scalers]
         assert (types := set([type(scaler) for scaler in scalers])) == {
@@ -167,13 +173,11 @@ def context_map_by_wcs(
     iy = iy.astype(int)
 
     # Make context array
-    ctxt = np.zeros((4, *list(reversed(wcs.pixel_shape))))
+    ctxt = np.zeros((1 + len(qtys), *list(reversed(wcs.pixel_shape))))
     ctxt[0][iy, ix] = 1
-    qtys = ["Total_flux", "Peak_flux", "Maj"]
-    for i, (qty, scaler) in enumerate(zip(qtys, scalers), start=1):
-        ctxt[i][iy, ix] = (
-            scaler.scale(sub_cat[qty].values) if scale_output else sub_cat[qty].values
-        )
+    for i, qty in enumerate(qtys, start=1):
+        values = sub_cat[qty].values
+        ctxt[i][iy, ix] = scalers[i - 1].scale(values) if scale_output else values
     return ctxt, sub_cat
 
 
@@ -234,6 +238,13 @@ def reduce_context_map(
         case _:
             raise ValueError(f"Unsupported array dimension: {ctxt_arr.ndim}")
 
+    n_value_channels = ctxt_arr.shape[1] - 1
+    if (input_scaled or scale_output) and len(scalers) != n_value_channels:
+        raise ValueError(
+            f"Scaling needs one scaler per value channel, got {len(scalers)} "
+            f"scalers for {n_value_channels} value channels."
+        )
+
     # Invert the scaling before the sum
     arr_inv_sc = ctxt_arr.clone() if is_torch else ctxt_arr.copy()
     arr_mask = arr_inv_sc[:, 0] > 0
@@ -263,10 +274,10 @@ def reduce_context_map(
     arr_red[:, 0] = arr_mask
     # Apply the scaling again to the summed values
     # Also, set -inf to zero (we get -inf where unscaled values are 0)
-    for i, scaler in enumerate(scalers, start=1):
+    for i in range(1, n_value_channels + 1):
         arr_red[:, i] = (torch.where if is_torch else np.where)(
             (torch if is_torch else np).isfinite(arr_red[:, i]),
-            scaler.scale(arr_red[:, i]) if scale_output else arr_red[:, i],
+            scalers[i - 1].scale(arr_red[:, i]) if scale_output else arr_red[:, i],
             0,
         )
 

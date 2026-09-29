@@ -51,6 +51,7 @@ class MicromapDatasetHF:
         weights_file=None,
         weights_fn=None,
         missing_is_error=True,
+        sidecar=None,
     ):
         """
         Args:
@@ -66,6 +67,12 @@ class MicromapDatasetHF:
             output_tuple: Tuple of keys to return
             max_beam_arcsec: Filter by beam size (not implemented for arrow yet)
             missing_is_error: Whether to error on missing keys
+            sidecar: Optional dict {"path", "column", "append_to"[, "allow_subset"]}.
+                Joins a sparse sidecar dataset (see
+                arrow.make_sparse_context_sidecar) by __key__ and appends its
+                channel to the `append_to` context as an extra last channel.
+                "allow_subset": restrict the dataset to the sidecar's keys
+                (for partial test sidecars).
         """
         self.logger = get_logger("MMDsHF")
 
@@ -100,6 +107,11 @@ class MicromapDatasetHF:
         self.logger.info(f"Loaded {len(self.dataset):_} samples")
         # Housekeeping
         self.dataset.cleanup_cache_files()
+
+        # Join sidecar context channel (before any filtering, so rows align)
+        self.sidecar = None
+        if sidecar is not None:
+            self._attach_sidecar(sidecar, split)
 
         # Load weights dict
         self.weights_dict = None
@@ -142,6 +154,50 @@ class MicromapDatasetHF:
     def from_preset(cls, preset: str | Path, **override) -> "MicromapDatasetHF":
         """Create a MicromapDatasetHF from a preset name or path, allowing for overrides."""
         return cls.from_config(MicromapsConfig.from_preset(preset), **override)
+
+    def _attach_sidecar(self, sidecar, split):
+        column, append_to = sidecar["column"], sidecar["append_to"]
+        if append_to not in self.output_tuple:
+            raise ValueError(
+                f"Sidecar append_to '{append_to}' is not in output_tuple {self.output_tuple}."
+            )
+        sc_path = Path(sidecar["path"]) / f"{split}.arrow"
+        self.logger.info(f"Loading sidecar '{column}' from\n\t{sc_path}")
+        sc = load_from_disk(str(sc_path)).sort("__key__")
+        sc_keys = sc["__key__"]
+
+        if sidecar.get("allow_subset", False):
+            keep = set(sc_keys)
+            select_idxs = [
+                i for i, k in enumerate(self.dataset["__key__"]) if k in keep
+            ]
+            self.logger.warning(
+                f"allow_subset: restricting dataset to {len(select_idxs):_} "
+                f"of {len(self.dataset):_} samples covered by the sidecar."
+            )
+            self.dataset = self.dataset.select(select_idxs)
+
+        if self.dataset["__key__"] != sc_keys:
+            raise ValueError(
+                f"Sidecar keys do not match the dataset keys "
+                f"({len(sc_keys):_} vs {len(self.dataset):_} samples). "
+                "Was the sidecar built from this dataset and split?"
+            )
+        self.dataset = concatenate_datasets(
+            [self.dataset, sc.select_columns([f"{column}_idx", f"{column}_val"])],
+            axis=1,
+        )
+        self.sidecar = dict(column=column, append_to=append_to)
+
+    def _append_sidecar_channel(self, sample, sample_dict):
+        col, key = self.sidecar["column"], self.sidecar["append_to"]
+        target = torch.as_tensor(sample_dict[key])
+        h, w = target.shape[-2:]
+        channel = torch.zeros(h * w, dtype=target.dtype)
+        channel[torch.as_tensor(sample[f"{col}_idx"], dtype=torch.long)] = (
+            torch.as_tensor(sample[f"{col}_val"], dtype=target.dtype)
+        )
+        sample_dict[key] = torch.cat([target, channel.view(1, h, w)], dim=0)
 
     def _filter_weights_dict(self):
         """Filter weights_dict to match current dataset keys."""
@@ -256,6 +312,10 @@ class MicromapDatasetHF:
             else:
                 self.logger.warning(f"Key '{key}' not found in sample, skipping")
                 return None
+
+        # Before post-transform, so crops apply to the extra channel too
+        if self.sidecar is not None:
+            self._append_sidecar_channel(sample, sample_dict)
 
         # Apply post-transform to entire sample dict
         sample_dict = self.post_transform(sample_dict)

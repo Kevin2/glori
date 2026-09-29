@@ -8,6 +8,7 @@ from collections import namedtuple
 from pathlib import Path
 from functools import partial
 
+import datasets
 import torch.distributed
 import wandb
 import torch
@@ -61,6 +62,10 @@ if __name__ == "__main__":
     # i.e. the first time the script is run
     is_main_process = int(os.environ.get("LOCAL_RANK", 0)) == 0
 
+    # HF datasets writes index caches next to the arrow files by default, which
+    # fails on datasets the current user can only read; use temp dirs instead.
+    datasets.disable_caching()
+
     # Hyperparameters
     # Get preset name from user input. Use default if no input is passed.
     preset_name = args.config  # if len(os.sys.argv) > 1 else "VAE"
@@ -68,11 +73,14 @@ if __name__ == "__main__":
 
     # Some global config settings should propagate into the training and
     # model configs for convenience
+    # (newer presets keep img/catalog_context inside dataset_config)
     conf.train_config["context"] = conf.train_config.get("context", [])
-    if conf.get("img_context") is not None:
-        conf.train_config["context"].append("img_context")
-    if conf.get("catalog_context") is not None:
-        conf.train_config["context"].append("catalog_context")
+    dset_cfg = conf.get("dataset_config") or {}
+    for ctxt in ("img_context", "catalog_context"):
+        if (
+            conf.get(ctxt) is not None or dset_cfg.get(ctxt) is not None
+        ) and ctxt not in conf.train_config["context"]:
+            conf.train_config["context"].append(ctxt)
 
     if is_main_process:
         if Ncpu != -1:
@@ -84,7 +92,8 @@ if __name__ == "__main__":
     dset_conf = MicromapsConfig(**conf.dataset_config)
 
     # Set output directory
-    output_dir = paths.MODEL_PARENT / conf.model_name
+    model_root = Path(conf.get("model_parent") or paths.MODEL_PARENT)
+    output_dir = model_root / conf.model_name
 
     # Sometimes interrupting leaves a broken symlink
     ckpt_path = output_dir / "lightning" / "last.ckpt"
@@ -210,7 +219,11 @@ if __name__ == "__main__":
 
     # Parse checkpoint path
     ckpt_path = (
-        parse_lightning_ckpt(conf.checkpoint, model_name=conf.model_name)
+        parse_lightning_ckpt(
+            conf.checkpoint,
+            model_name=conf.model_name,
+            model_parent=model_root / conf.model_name,
+        )
         if (
             conf.get("pickup", False)
             or conf.get("weights_only", False)

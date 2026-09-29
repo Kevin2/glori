@@ -1,6 +1,7 @@
 import os
 import gc
 import sys
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -912,6 +913,161 @@ def make_contexts(
                 f"\nPlease check the output directory {out_parent} for any temporary or backup files and resolve manually if needed."
             )
 
+    logger.info("All done!")
+
+
+_SIDECAR_CAT = None
+
+
+def _init_sidecar_worker(cat):
+    # Hand the catalog to each worker once, instead of pickling it per mosaic.
+    global _SIDECAR_CAT
+    _SIDECAR_CAT = cat
+
+
+def _sidecar_task(mosaic, keys, **kwargs):
+    return afc.sparse_sidecar_process_mosaic(mosaic, keys, cat=_SIDECAR_CAT, **kwargs)
+
+
+def _git_state():
+    repo = Path(__file__).parent
+    run = lambda *a: subprocess.run(
+        ["git", "-C", str(repo), *a], capture_output=True, text=True
+    ).stdout.strip()
+    return {"commit": run("rev-parse", "HEAD"), "dirty": bool(run("status", "--porcelain"))}
+
+
+def make_sparse_context_sidecar(
+    encs_dset,
+    out_dir,
+    qty="Isl_rms",
+    unit_factor=1e3,
+    column="rms_uJy",
+    dset_lookup=paths.MICROMAP_SUBSETS_ARROW,
+    catalog=paths.LOTSS_DR3_CAT,
+    mosaic_dir=paths.MOSAIC_DIR_DR3,
+    img_size=1024,
+    f_ctxt_size=2,
+    f_downscale=4,
+    splits=["train", "val", "test"],
+    max_workers=16,
+    max_mosaics=None,
+    overwrite=False,
+):
+    """
+    Build a sidecar dataset with one extra catalog-context channel
+    (catalog column `qty` times `unit_factor`) for every sample of an existing
+    micromap encodings dataset, stored sparse and keyed by `__key__`.
+
+    The source dataset is only read, never written: output goes to `out_dir`,
+    which must lie outside the source dataset. Load it alongside the source
+    via MicromapDatasetHF(sidecar=...). `max_mosaics` limits the number of
+    mosaics per split, for quick test runs.
+    """
+    encs_path = Path(parse_dset_path(encs_dset, lookup=dset_lookup)).resolve()
+    out_dir = Path(out_dir).resolve()
+    if (
+        out_dir == encs_path
+        or out_dir.is_relative_to(encs_path)
+        or encs_path.is_relative_to(out_dir)
+    ):
+        raise ValueError(
+            f"Sidecar output {out_dir} overlaps the source dataset {encs_path}; "
+            "choose a separate directory."
+        )
+    for split in splits:
+        if (out_dir / f"{split}.arrow").exists() and not overwrite:
+            raise FileExistsError(
+                f"{out_dir / f'{split}.arrow'} exists; pass overwrite=True to replace it."
+            )
+    (out_dir / "logs").mkdir(parents=True, exist_ok=True)
+    now = datetime.now().strftime("%Y%m%d-%H%M%S")
+    add_file_handler(logger, str(out_dir / "logs" / f"make_sidecar_{now}.log"))
+
+    logger.divider()
+    logger.info(
+        f"Building sparse sidecar '{column}' = {qty} * {unit_factor}\n"
+        f"\tsource dataset: {encs_path}\n\toutput: {out_dir}\n"
+        f"\t{img_size=}, {f_ctxt_size=}, {f_downscale=}, {splits=}"
+    )
+
+    # Same catalog + DEC sort as make_contexts, so source positions match.
+    logger.info(f"Loading catalog from: \n\t{catalog}.\n")
+    cat = load_lotss_catalog(catalog, select_cols=["RA", "DEC", qty])
+    cat[qty] = cat[qty] * unit_factor
+    cat.sort_values(by="DEC", inplace=True)
+
+    task_kwargs = dict(
+        mosaic_dir=Path(mosaic_dir),
+        qty=qty,
+        img_size=img_size,
+        f_ctxt_size=f_ctxt_size,
+        f_downscale=f_downscale,
+        column=column,
+    )
+    idx_col, val_col = f"{column}_idx", f"{column}_val"
+    features = datasets.Features(
+        {
+            "__key__": datasets.Value("string"),
+            idx_col: datasets.Sequence(datasets.Value("int32")),
+            val_col: datasets.Sequence(datasets.Value("float32")),
+        }
+    )
+
+    for split in splits:
+        logger.separator(f"Processing split: {split}")
+        keys = (
+            datasets.load_from_disk(str(encs_path / f"{split}.arrow"))
+            .select_columns(["__key__"])
+            .to_pandas()["__key__"]
+        )
+        groups = {
+            m: ks.tolist()
+            for m, ks in keys.groupby(keys.str.split("-", n=1).str.get(0))
+        }
+        if max_mosaics is not None:
+            groups = dict(list(groups.items())[:max_mosaics])
+        n_samples = sum(len(ks) for ks in groups.values())
+        logger.info(f"{n_samples:_} samples in {len(groups)} mosaics.")
+
+        rows = {"__key__": [], idx_col: [], val_col: []}
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_init_sidecar_worker,
+            initargs=(cat,),
+        ) as executor:
+            futures = {
+                executor.submit(_sidecar_task, m, ks, **task_kwargs): m
+                for m, ks in groups.items()
+            }
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc=f"{split} mosaics"
+            ):
+                result = future.result()
+                for k in rows:
+                    rows[k].extend(result[k])
+
+        sidecar = datasets.Dataset.from_dict(rows, features=features).sort("__key__")
+        sidecar.save_to_disk(str(out_dir / f"{split}.arrow"))
+        logger.info(f"Saved {len(sidecar):_} samples for split {split}.")
+
+    info = dict(
+        column=column,
+        qty=qty,
+        unit_factor=unit_factor,
+        source_dataset=str(encs_path),
+        catalog=str(catalog),
+        mosaic_dir=str(mosaic_dir),
+        img_size=img_size,
+        f_ctxt_size=f_ctxt_size,
+        f_downscale=f_downscale,
+        channel_shape=[img_size * f_ctxt_size // f_downscale] * 2,
+        splits=splits,
+        max_mosaics=max_mosaics,
+        created=now,
+        git=_git_state(),
+    )
+    (out_dir / "sidecar_info.json").write_text(json.dumps(info, indent=2))
     logger.info("All done!")
 
 

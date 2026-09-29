@@ -1,4 +1,5 @@
-from glori.data.obs.micromaps.arrow import logger
+import logging
+
 from glori.data.obs.micromaps.utils import (
     context_map_by_wcs,
     reduce_context_map,
@@ -22,6 +23,10 @@ import glori.settings.paths as paths
 
 from datasets.arrow_writer import OptimizedTypedSequence
 from datasets.features.features import Features
+
+# Same logger object that arrow.py configures (importing it from arrow.py
+# would be circular, since arrow.py imports this module first).
+logger = logging.getLogger("mm-arrow")
 
 
 def get_samples_from_mosaic(
@@ -187,3 +192,47 @@ def add_context_process_mosaic(
         enable_progress_bars()
 
     return encs_subset
+
+
+def sparse_sidecar_process_mosaic(
+    mosaic,
+    keys,
+    cat,
+    mosaic_dir,
+    qty,
+    img_size,
+    f_ctxt_size,
+    f_downscale,
+    column,
+):
+    """
+    Build one extra catalog-context channel (catalog column `qty`) for the given
+    sample keys of one mosaic. Goes through the same context_map_by_wcs ->
+    add_context_to_sample path as add_context_process_mosaic, so the geometry
+    matches the stored 4-channel context exactly. Returned sparse (flat pixel
+    indices + values), since the channel is zero away from sources.
+    """
+    mosaic_file = mosaic_dir / f"{mosaic}/mosaic-blanked.fits"
+    assert mosaic_file.exists(), f"Mosaic file for {mosaic} does not exist."
+    with fits.open(mosaic_file) as hdul:
+        wcs = WCS(hdul[0].header)
+
+    ctxt, _ = context_map_by_wcs(wcs, cat, scale_output=False, qtys=(qty,))
+
+    rows = {"__key__": [], f"{column}_idx": [], f"{column}_val": []}
+    for key in keys:
+        sample = add_context_to_sample(
+            {"__key__": key},
+            ctxt=ctxt,
+            mosaic=mosaic,
+            img_size=img_size,
+            f_ctxt_size=f_ctxt_size,
+            f_downscale=f_downscale,
+        )
+        reduced = next(v for k, v in sample.items() if k != "__key__")
+        channel = np.asarray(reduced[1]).ravel()
+        nonzero = np.flatnonzero(channel)
+        rows["__key__"].append(key)
+        rows[f"{column}_idx"].append(nonzero.astype(np.int32))
+        rows[f"{column}_val"].append(channel[nonzero].astype(np.float32))
+    return rows

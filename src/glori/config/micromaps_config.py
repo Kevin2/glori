@@ -31,6 +31,8 @@ class MicromapsConfig:
     weights_file: str | None = None
     weights_fn: str | None = None
     missing_is_error: bool = True
+    # Extra context channel from a separate dataset, see MicromapDatasetHF
+    sidecar: dict | None = None
 
     @classmethod
     def from_preset(cls, preset: str | Path) -> "MicromapsConfig":
@@ -113,6 +115,8 @@ def resolve_micromap_kwargs(config: MicromapsConfig, **override) -> dict:
                 keys=("npy", *list(ctxt_transform.keys())),
             )
         )
+    # The unused one of random_crop / center_crop is still in the dict
+    config_dict.pop("center_crop", None)
     config_dict.pop("crop_fctxt", None)
     config_dict.pop("crop_sctxt", None)
     if (blank_center := config_dict.pop("blank_center", None)) is not None:
