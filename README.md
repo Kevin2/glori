@@ -103,20 +103,25 @@ Note the pinned dependencies (`torch==2.2.1`, `numpy==1.25.2`, a specific `vqtor
 commit, etc.) — this repo is tied to fairly old, specific versions, so don't casually
 upgrade them (see "Known issues" below for what breaks if you do).
 
+**On a fresh machine it is necessary to change two paths in
+`glori`:** open `src/glori/settings/paths.py` and change `STORAGE_PARENT`
+to a path on your own machine, e.g. `Path.home() / "glori_storage"`.
+Every path this package uses (model checkpoints, cache, image data, ...) is derived from
+it, and the whole directory tree is created automatically the first time you import
+`glori` — but only under whatever `STORAGE_PARENT` currently points to.
+
 ## Storage locations
 
 All data/model paths are centralized in `src/glori/settings/paths.py`, keyed off a single
-`STORAGE_PARENT` constant. **If you're setting this up outside the original group storage,
-change `STORAGE_PARENT` at the top of that file** — everything else (`MODEL_PARENT`,
-`IMG_DATA_PARENT`, dataset subset lookups, etc.) is derived from it. Model checkpoints are
-expected at `<STORAGE_PARENT>/model_results/<model_name>/lightning/*.ckpt`, resolved by
-name via `glori.models.load.parse_lightning_ckpt` (checkpoint selectors like `"best"`,
-`"last"`, `"best-ema"`, `"best-last-N%"`, or an explicit path, are all supported).
+`STORAGE_PARENT` constant.
 
-**You don't need any of this machinery just to run inference**, though — see below.
-The easiest option for inference is `glori.hub.download_pretrained(...)` (see
-Quickstart), which fetches straight from the public Hugging Face repo and doesn't
-touch `STORAGE_PARENT` at all.
+Importing `glori.settings.paths`
+creates the directory tree under `STORAGE_PARENT` automatically if it doesn't exist yet.
+
+**You don't need any of this machinery just to run inference**, though. The easiest
+option for inference is `glori.hub.download_pretrained(...)` (see Quickstart), which
+fetches straight from the public Hugging Face repo and doesn't use `STORAGE_PARENT`
+for anything — it still creates the (empty, harmless) `STORAGE_PARENT` directory tree.
 
 ## Pretrained models
 
@@ -182,9 +187,13 @@ sources appear), sampling larger maps, and understanding the sampling parameters
 
 ## Known issues / gotchas
 
-- **`STORAGE_PARENT`** in `settings/paths.py` is hardcoded to a specific path. Change it
-  for your own setup, or use the explicit-checkpoint-path pattern above to bypass it
-  entirely for inference.
+- **`STORAGE_PARENT`** in `settings/paths.py` is hardcoded to the original author's
+  cluster path. Change it for your own setup (see "Installation"/"Storage locations"
+  above), or use the explicit-checkpoint-path pattern above to bypass it entirely for
+  inference. The directory tree under it is created automatically on import, so you
+  don't need to `mkdir` anything yourself once it points somewhere valid — but on a
+  fresh machine you do need to change it *before* the first `import glori...`, or the
+  auto-creation will target the original hardcoded path instead.
 - **`glori.models.load.load_model()` is dead code** — it unconditionally raises
   `NotImplementedError`. The real loading path (used everywhere in this codebase) is
   `SomeLightningClass.load_from_checkpoint(parse_lightning_ckpt(...))`.
