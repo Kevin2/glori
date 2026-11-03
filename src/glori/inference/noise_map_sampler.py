@@ -8,7 +8,8 @@ from a depth-matched catalog, as the single images of noise_sampler.py:
     depth <= 90 uJy/beam, survey coverage over the map and its context margin)
     with peak >= 8x the field's native noise and >= 3 T
   - synthetic DR3-like sources below that, peak = SNR x T
-  - rms channel = T / 1.07
+  - rms channel = T / 1.07 plus, in quadrature, the real noise excess around
+    bright sources
 The noise of a map is the median of its PyBDSF rms map. Per map a noise s is
 drawn log-uniformly from the band, T is taken from the large-map calibration,
 and the map is rescaled by s / measured noise as a whole, so its median noise is
@@ -17,11 +18,20 @@ it). Maps are dropped and replaced if they need a rescale beyond `max_rescale`,
 if too few of their 512 px tiles have a DR3-like noise texture, or if bright
 input sources are missing.
 
-SWIIT maps come out with source fluxes 5-20 % below the catalog, depending on
-the field. The truth catalog is therefore calibrated per map: its fluxes are
-the input fluxes times the median measured / input peak flux of the map's own
-bright sources (input peak >= 20 T), or the calibrated factor of the depth if a
-map has fewer than 10 of them.
+SWIIT maps also drift in noise over several arcminutes, more than real DR3 fields
+(p95/p5 of 256 px blocks, bright-source areas masked: ~1.4 vs. ~1.16). By default
+each map is therefore flattened: it is multiplied by a smooth factor, median /
+local background rms (512 px blocks, bright-source areas masked, at most x1.3),
+and measured again. Sources and noise are scaled together, so local peaks around
+bright sources stay, and so does each source's local SNR.
+
+SWIIT maps come out with source fluxes below the catalog, depending on the
+field (factor 0.56-0.96 per 2048 px map in the test runs). The truth catalog is therefore calibrated per map: its fluxes are
+the input fluxes times the flattening factor at the source, a brightness factor
+(the denoiser compresses sources by their SNR, see noise_sampler.py; more than in
+single images above SNR ~5000, so maps have their own curve) and the median
+measured / expected peak flux of the map's own bright sources (input peak >= 20
+T), or the calibrated factor of the depth if a map has fewer than 10 of them.
 
 Calibration: configs/noise_calibration/rms-v1-swiit.json (built by
 scripts/ldm/build_noise_map_calibration.py). Requests outside its valid range
@@ -31,10 +41,11 @@ are refused.
 import contextlib
 import json
 import os
+import shutil
 import tempfile
 import time
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from multiprocessing import get_context
+import warnings
+from concurrent.futures import FIRST_COMPLETED, wait
 from pathlib import Path
 
 import numpy as np
@@ -51,13 +62,13 @@ from glori.inference.noise_sampler import (
     NoiseBandSampler,
     _anisotropy,
     _autocorr_halfwidth,
-    _worker_init,
     code_version,
     depth_matched_context,
     dr3_fields,
     fetch_field_context,
     load_scaler,
     snr_pool,
+    start_bdsf_pool,
     write_fits,
 )
 
@@ -65,6 +76,9 @@ NOISE_MAP_CALIBRATION = paths.CONFIG_PARENT / "noise_calibration" / "rms-v1-swii
 TILE_PX = 512  # texture is checked per 512 px tile, the size of the real DR3 reference
 PAD = 64  # context margin around the map for SWIIT's extended context [cells]
 STRIDE_PX = 256  # SWIIT tile stride: map sizes are 512 + k * 256 px
+FLATTEN_BLOCK_PX = 512  # scale of the background rms trend that flattening removes (13')
+FLATTEN_MAX = 1.3  # largest local correction, like the global rescale
+BRIGHT_MASK = [(100, 80), (30, 40)]  # (min peak SNR, radius [px]): ignored in the background
 
 
 # ---- DR3 fields ------------------------------------------------------------------
@@ -114,9 +128,7 @@ def measure_map(img, tmpdir):
             res = bdsf_on_image(img.astype(np.float64), tmpdir=tmp, **kw)
             srl = catalogs_from_bdsf(res, tmpdir=tmp)["srl"]
     finally:
-        for f in tmp.glob("*"):
-            f.unlink()
-        tmp.rmdir()
+        shutil.rmtree(tmp, ignore_errors=True)  # on NFS, files PyBDSF still holds stay until it lets go
     rms_map = np.asarray(res.rms_arr).squeeze().T
     resid = np.asarray(res.resid_gaus_arr).squeeze().T
     sigma = float(np.median(rms_map))
@@ -158,9 +170,64 @@ def measure_map(img, tmpdir):
     return m, tiles, srl, rms_map.astype(np.float32)
 
 
-def _measure_map_job(img, tmpdir):
+def bright_mask(shape, x, y, snr):
+    """Pixels around bright sources (see BRIGHT_MASK)."""
+    mask = np.zeros(shape, bool)
+    for thr, rad in BRIGHT_MASK:
+        for xi, yi in zip(x[snr >= thr], y[snr >= thr]):
+            y0, x0 = max(int(yi) - rad - 1, 0), max(int(xi) - rad - 1, 0)
+            yy, xx = np.ogrid[y0 : int(yi) + rad + 2, x0 : int(xi) + rad + 2]
+            yy, xx = yy[yy < shape[0]][:, None], xx[xx < shape[1]][None, :]
+            mask[y0 : y0 + yy.size, x0 : x0 + xx.size] |= (xx - xi) ** 2 + (yy - yi) ** 2 < rad**2
+    return mask
+
+
+def flatten_factor(rms_map, x, y, snr, block=FLATTEN_BLOCK_PX, max_factor=FLATTEN_MAX):
+    """
+    Smooth factor that flattens the background of an rms map: median / local
+    background, the background being the median rms in blocks of `block` px
+    outside the bright-source areas, interpolated with a spline in log rms.
+    x, y [px], snr: PyBDSF sources of the map.
+    """
+    from scipy.interpolate import RectBivariateSpline
+
+    mask = bright_mask(rms_map.shape, x, y, snr)
+    n = rms_map.shape[0] // block
+    bg = np.full((n, n), np.nan)
+    for i in range(n):
+        for j in range(n):
+            sl = np.s_[i * block : (i + 1) * block, j * block : (j + 1) * block]
+            free = ~mask[sl]
+            if free.mean() >= 0.3:
+                bg[i, j] = np.median(rms_map[sl][free])
+    if np.isnan(bg).all():
+        return np.ones(rms_map.shape, np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # empty neighbourhoods
+        while np.isnan(bg).any():  # blocks dominated by bright sources: mean of their neighbours
+            nb = [[np.nanmean(bg[max(i - 1, 0) : i + 2, max(j - 1, 0) : j + 2]) for j in range(n)] for i in range(n)]
+            bg = np.where(np.isnan(bg), nb, bg)
+    centres = (np.arange(n) + 0.5) * block - 0.5
+    k = min(3, n - 1)
+    spline = RectBivariateSpline(centres, centres, np.log(bg), kx=k, ky=k)
+    px = np.arange(rms_map.shape[0])
+    bg_map = np.exp(spline(px, px))
+    return np.clip(np.median(bg_map) / bg_map, 1 / max_factor, max_factor).astype(np.float32)
+
+
+def _measure_map_job(img, tmpdir, flatten):
+    """measure_map of the map, with flatten: of the flattened map. Also returns the factor (or None)."""
     try:
-        return measure_map(img, tmpdir), None
+        m, tiles, srl, rms_map = measure_map(img, tmpdir)
+        factor = None
+        if flatten:
+            snr = srl.Peak_flux.values.astype(float) * 1e6 / m["noise_uJy"]
+            factor = flatten_factor(rms_map, srl.x_px.values.astype(float), srl.y_px.values.astype(float), snr)
+            before = m
+            m, tiles, srl, rms_map = measure_map(img * factor, tmpdir)
+            m["rms_spread_unflattened"] = before["rms_spread"]
+            m["flatten_min"], m["flatten_max"] = float(factor.min()), float(factor.max())
+        return (m, tiles, srl, rms_map, factor), None
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
@@ -275,12 +342,13 @@ class NoiseBandMapSampler(NoiseBandSampler):
         d, j = cKDTree(srl[["x_px", "y_px"]].values).query(truth[["x_px", "y_px"]].values)
         return j, d < MATCH_PX
 
-    def _flux_factor_map(self, truth, srl, j, hit, depth, noise):
-        """Measured / input peak flux of the map from its own bright sources, else calibrated."""
+    def _flux_factor_map(self, truth, srl, j, hit, depth, noise, g_peak):
+        """Measured / expected peak flux of the map from its own bright sources, else calibrated."""
         crit = self.calib["criteria"]
         sel = hit & (truth.peak_flux_input.values * 1e6 >= crit["flux_snr"] * depth)
         if sel.sum() >= crit["min_flux_sources"]:
-            r = srl.Peak_flux.values[j[sel]] / truth.peak_flux_input.values[sel]
+            expected = truth.peak_flux_input.values[sel] * truth.flatten_factor.values[sel] * g_peak[sel]
+            r = srl.Peak_flux.values[j[sel]] / expected
             return float(np.median(r)), int(sel.sum()), "map"
         return float(self.flux_factor(depth, noise)), int(sel.sum()), "calibration"
 
@@ -303,19 +371,30 @@ class NoiseBandMapSampler(NoiseBandSampler):
         return None
 
     def sample(
-        self, noise_min, noise_max, n, out_dir, map_px=2048, seed=0, max_rescale=None, max_attempts=None
+        self,
+        noise_min,
+        noise_max,
+        n,
+        out_dir,
+        map_px=2048,
+        seed=0,
+        max_rescale=None,
+        max_attempts=None,
+        flatten=True,
     ):
         """
         Generate `n` maps of `map_px` x `map_px` px whose median PyBDSF noise is in
         [noise_min, noise_max] uJy/beam and that pass the quality checks. Writes
         FITS maps and rms maps, the truth and PyBDSF catalogs, a tile table and a
-        report to `out_dir`.
+        report to `out_dir`. flatten: remove the large-scale noise trend of each
+        map (a second PyBDSF run per map).
         """
         self.check_band(noise_min, noise_max)
         self.check_size(map_px)
         band = (float(noise_min), float(noise_max))
         max_rescale = max_rescale or self.calib["criteria"]["max_rescale"]
         max_attempts = max_attempts or 2 * n + self.batch_size
+        pool = start_bdsf_pool(self.bdsf_workers, self.bdsf_nice)
         out = Path(out_dir)
         (out / "maps").mkdir(parents=True, exist_ok=True)
         tmpdir = Path(tempfile.mkdtemp(prefix="bdsf_", dir=out))
@@ -327,12 +406,6 @@ class NoiseBandMapSampler(NoiseBandSampler):
 
         kept, truths, srls, tile_rows, rejected = [], [], [], [], {}
         n_tried, t0 = 0, time.time()
-        pool = ProcessPoolExecutor(
-            max_workers=self.bdsf_workers,
-            mp_context=get_context("spawn"),
-            initializer=_worker_init,
-            initargs=(self.bdsf_nice,),
-        )
         pending = {}
         try:
             while len(kept) < n:
@@ -344,7 +417,7 @@ class NoiseBandMapSampler(NoiseBandSampler):
                     imgs, ctxs, syns, infos = self._generate(nb, band, rng, map_px)
                     self.logger.info(f"Sampled {nb} maps in {time.time() - t_gen:.0f}s")
                     for img, c, s, inf in zip(imgs, ctxs, syns, infos):
-                        pending[pool.submit(_measure_map_job, img, tmpdir)] = (img, c, s, inf)
+                        pending[pool.submit(_measure_map_job, img, tmpdir, flatten)] = (img, c, s, inf)
                     n_tried += nb
                     continue
                 if not pending:
@@ -357,7 +430,9 @@ class NoiseBandMapSampler(NoiseBandSampler):
                         self.logger.warning(f"PyBDSF failed: {err}")
                         rejected["PyBDSF failed"] = rejected.get("PyBDSF failed", 0) + 1
                         continue
-                    m, tiles, srl, rms_map = res
+                    m, tiles, srl, rms_map, factor = res
+                    if factor is not None:
+                        img = img * factor
                     # PyBDSF is scale-invariant: rescaling the map scales its rms
                     # map and catalog fluxes by the same factor, detections stay
                     m["noise_generated_uJy"] = m["noise_uJy"]
@@ -371,12 +446,16 @@ class NoiseBandMapSampler(NoiseBandSampler):
                         if col in srl:
                             srl[col] = srl[col] * m["rescale"]
                     truth = map_truth_catalog(c, s)
-                    j, hit = self._match(truth, srl)
-                    ff, n_ff, ff_from = self._flux_factor_map(
-                        truth, srl, j, hit, inf["depth_uJy"], m["noise_uJy"]
+                    truth["flatten_factor"] = (
+                        factor[truth.y_px.astype(int), truth.x_px.astype(int)] if factor is not None else 1.0
                     )
-                    truth["peak_flux"] = truth.peak_flux_input * ff
-                    truth["total_flux"] = truth.total_flux_input * ff
+                    j, hit = self._match(truth, srl)
+                    g_peak, g_total = self.brightness_factors(truth, m["noise_uJy"])
+                    ff, n_ff, ff_from = self._flux_factor_map(
+                        truth, srl, j, hit, inf["depth_uJy"], m["noise_uJy"], g_peak
+                    )
+                    truth["peak_flux"] = truth.peak_flux_input * ff * truth.flatten_factor * g_peak
+                    truth["total_flux"] = truth.total_flux_input * ff * truth.flatten_factor * g_total
                     truth["detected"] = hit
                     why = self._judge_map(m, tiles, truth, hit, max_rescale)
                     if why is not None or len(kept) >= n:
@@ -406,7 +485,8 @@ class NoiseBandMapSampler(NoiseBandSampler):
                         NOISE=(round(m["noise_uJy"], 3), "median of PyBDSF rms map [uJy/beam]"),
                         RESCALE=(round(m["rescale"], 4), "factor applied to the generated map"),
                         DEPTH=(round(inf["depth_uJy"], 3), "catalog depth T [uJy/beam]"),
-                        FLUXFAC=(round(ff, 4), f"truth flux / input flux ({ff_from})"),
+                        FLUXFAC=(round(ff, 4), f"flux factor of the map ({ff_from})"),
+                        FLATTEN=(factor is not None, "large-scale noise trend removed"),
                         FIELDRA=(round(inf["field_ra"], 4), "DR3 field of the real sources [deg]"),
                         FIELDDEC=(round(inf["field_dec"], 4), "DR3 field of the real sources [deg]"),
                         MODEL=(self.checkpoint("denoiser").stem, "denoiser, SWIIT"),
@@ -423,9 +503,7 @@ class NoiseBandMapSampler(NoiseBandSampler):
             for f in pending:
                 f.cancel()
             pool.shutdown(wait=True, cancel_futures=True)
-            for f in tmpdir.glob("*"):
-                f.unlink()
-            tmpdir.rmdir()
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
         summary = pd.DataFrame(kept)
         summary.to_csv(out / "summary.csv", index=False)
@@ -434,7 +512,9 @@ class NoiseBandMapSampler(NoiseBandSampler):
             pd.concat(srls, ignore_index=True).to_csv(out / "pybdsf_catalog.csv", index=False)
             pd.DataFrame(tile_rows).to_csv(out / "tiles.csv", index=False)
         report = dict(
-            request=dict(noise_min_uJy=band[0], noise_max_uJy=band[1], n=n, map_px=map_px, seed=seed),
+            request=dict(
+                noise_min_uJy=band[0], noise_max_uJy=band[1], n=n, map_px=map_px, seed=seed, flatten=flatten
+            ),
             n_kept=len(kept),
             n_generated=n_tried,
             rejected=rejected,

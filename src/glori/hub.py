@@ -26,6 +26,7 @@ _FILES = {
     # data of the noise-band tools (glori.inference.noise_sampler / noise_map_sampler)
     "dr3_snr_pool": "noise/dr3_snr_pool.npz",
     "dr3_fields": "noise/dr3_fields.csv",
+    "dr3_depth_tiles": "noise/dr3_depth_tiles.csv",
 }
 
 
@@ -42,7 +43,7 @@ def download_pretrained(component: str, repo_id: str = DEFAULT_REPO_ID) -> Path:
     component : str
         Which file to fetch. One of: "denoiser", "denoiser-rms", "vae", "scaler",
         "ctxt_scaler_ftot", "ctxt_scaler_fpeak", "ctxt_scaler_maj",
-        "dr3_snr_pool", "dr3_fields".
+        "dr3_snr_pool", "dr3_fields", "dr3_depth_tiles".
     repo_id : str, optional
         Hugging Face Hub repo to download from. Defaults to the reference
         pretrained models for this codebase.

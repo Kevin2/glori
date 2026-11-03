@@ -5,26 +5,40 @@ Generate LOFAR-like 512x512 images whose noise lies in a requested band, e.g.
 Noise is the median of the PyBDSF rms map (LoTSS settings, 6" beam, 1.5" px).
 The rms-conditioned denoiser (LDM-Denoiser-WnetCC-rms-v1) cannot reach an
 absolute noise from the rms channel alone, since the catalog itself encodes the
-depth. Every image is therefore generated from a catalog consistent with a
-depth T:
-  - real LoTSS-DR3 sources of a random DR3 field (public cone search) with
+depth. Every image is therefore generated from a catalog consistent with its
+noise, in one of two modes (`mode` in summary.csv, MODE in the FITS header).
+
+Real depth, for noise below `real_depth.max_noise_uJy` of the calibration: the
+unchanged real catalog of a DR3 tile whose own depth gives that noise. Bright
+sources occur as often as in the real sky and their artefacts follow the real
+Isl_rms.
+
+Depth matched, above that. Flux recovery of the real-depth mode falls below the
+calibration limit at higher noise, and DR3 has few fields of more than ~150
+uJy/beam. The catalog of a depth T is built from a DR3 field of native noise <= 90 uJy/beam:
+  - real LoTSS-DR3 sources of the field (public cone search) with
     peak >= 8x its native noise (LoTSS is complete there) and >= 3 T
   - synthetic sources below that, with (SNR, total/peak, Maj) drawn from DR3,
     peak = SNR x T and a number following the DR3 density-depth relation
-  - rms channel = T / 1.07 at every source pixel
-Per image, a noise s is drawn log-uniformly from the requested band and T is
-taken from the calibration so that the median generated noise is s. The image
-is measured with PyBDSF and rescaled by s / measured noise, so its noise is
-exactly s; the model scales sources and noise together, so the catalog fluxes
-stay consistent (calibrated residual factor in the truth catalog). Images that
+  - rms channel = T / 1.07 at every source pixel, plus in quadrature the noise
+    excess the real catalog has there (artefacts around bright sources), which
+    follows the source brightness and not the depth
+Per image, a noise s is drawn log-uniformly from the requested band and the
+tile or T is taken from the calibration so that the median generated noise is s.
+The image is measured with PyBDSF and rescaled by s / measured noise, so its
+noise is exactly s; the model scales sources and noise together, so the catalog
+fluxes stay consistent. The truth catalog holds what is in the image: the input
+flux times the flux factor of the image (from its own bright sources if it has
+enough, else calibrated) and a brightness factor, since the denoiser compresses
+sources by their SNR (calibrated, about 0.6 at SNR 3000). Images that
 would need a rescale beyond `max_rescale` or fail the quality checks of the
 calibration (noise texture like real DR3 cutouts of that noise, bright input
 sources recovered) are dropped and replaced.
 
 Calibration: configs/noise_calibration/rms-v1.json (built by
 scripts/ldm/build_noise_calibration.py). Requests outside its valid range are
-refused. The checkpoints, the scaler and two small DR3-derived data files (source
-properties, field centres) come from the Hugging Face repository via glori.hub;
+refused. The checkpoints, the scaler and small DR3-derived data files (source
+properties, field centres, tiles) come from the Hugging Face repository via glori.hub;
 source catalogs are queried from the public LoTSS-DR3 cone search.
 """
 
@@ -32,16 +46,19 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import get_context
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+from scipy.spatial import cKDTree
 
 import glori.infra.logging as my_logging
 import glori.settings.paths as paths
@@ -55,7 +72,9 @@ IMAGE_SIZE, LATENT_SIZE = 512, 128
 CTX_SIZE, CTX_PX = 256, 4  # context covers 1024 px, image is context[64:192, 64:192]
 CELL_DEG = CTX_PX * 1.5 / 3600  # one context cell is 6"
 MATCH_PX = 8.0  # 12", generated sources sit ~2-3 px off the catalog position
+EXCESS_RADIUS_CELLS = 20  # 2', synthetic sources take the noise excess of a real source this close
 TEXTURE = ["grain_px", "neg5", "pos5", "aniso"]
+TILE_WINDOW = 1.1  # real depth: tiles with a depth within this factor of the wanted one
 
 
 # ---- released data, DR3 catalog and fields ------------------------------------
@@ -71,6 +90,13 @@ def dr3_fields():
     from glori.hub import download_pretrained
 
     return pd.read_csv(download_pretrained("dr3_fields"))
+
+
+def dr3_depth_tiles():
+    """Image-sized DR3 tiles with their own depth: ra, dec, isl_uJy (released file)."""
+    from glori.hub import download_pretrained
+
+    return pd.read_csv(download_pretrained("dr3_depth_tiles"))
 
 
 def load_dr3_catalog():
@@ -202,10 +228,36 @@ def depth_matched_context(ctxt, depth, pool, rng, method):
     c[1][yy, xx] = peak_mJy * draws[:, 1]
     c[2][yy, xx] = peak_mJy
     c[3][yy, xx] = draws[:, 2]
-    c[4] = (c[0] > 0) * (depth / method["img_to_isl"])
     synthetic = np.zeros_like(keep)
     synthetic[yy, xx] = True
+    c[4] = rms_channel(ctxt, c, synthetic, depth, method)
     return c, synthetic
+
+
+def rms_channel(ctxt, c, synthetic, depth, method):
+    """
+    Rms channel of the depth-matched context c, from the real context ctxt. The
+    noise around bright sources comes from their artefacts, whose level does not
+    depend on the depth, so the real excess sqrt(Isl_rms^2 - native^2) is added in
+    quadrature to the depth. Synthetic sources take the excess of the nearest real
+    source within EXCESS_RADIUS_CELLS. Real cells hold the sum over their sources.
+    """
+    base = depth / method["img_to_isl"]
+    channel = (c[0] > 0) * base
+    src = ctxt[0] > 0
+    if not src.any():
+        return channel
+    isl = ctxt[4][src] / ((ctxt[0][src] + 1) / 2)
+    excess2 = np.zeros_like(ctxt[4])
+    excess2[src] = np.maximum(isl**2 - np.median(isl) ** 2, 0)
+
+    real = (c[0] > 0) & ~synthetic
+    channel[real] = np.sqrt(base**2 + excess2[real]) * (c[0][real] + 1) / 2
+    if synthetic.any():
+        dist, nearest = cKDTree(np.argwhere(src)).query(np.argwhere(synthetic))
+        near = np.where(dist <= EXCESS_RADIUS_CELLS, excess2[src][nearest], 0.0)
+        channel[synthetic] = np.sqrt(base**2 + near)
+    return channel
 
 
 def truth_catalog(ctxt, synthetic):
@@ -301,6 +353,28 @@ def _worker_init(nice):
     os.nice(nice)
 
 
+def start_bdsf_pool(workers, nice):
+    """
+    Start the PyBDSF workers before anything else happens. They are spawned, so a
+    script without `if __name__ == "__main__":` runs again in each of them. Started
+    here, such a script stops at once, instead of sampling on the GPU in every worker.
+    """
+    pool = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=get_context("spawn"),
+        initializer=_worker_init,
+        initargs=(nice,),
+    )
+    try:
+        pool.submit(int).result()
+    except BrokenProcessPool:
+        raise RuntimeError(
+            "The PyBDSF workers failed to start. In a script, call sample() under "
+            '`if __name__ == "__main__":`, see the errors above.'
+        ) from None
+    return pool
+
+
 def write_fits(img, fpath, **cards):
     """Image in the PyBDSF header convention, plus (value, comment) cards."""
     from astropy.io import fits
@@ -343,7 +417,7 @@ class NoiseBandSampler:
         self.device, self.batch_size = device, batch_size
         self.bdsf_workers = bdsf_workers or max(1, min(24, (os.cpu_count() or 4) - 2))
         self.bdsf_nice = bdsf_nice
-        self._sampler = self._base = self._pool = None
+        self._sampler = self._base = self._pool = self._tiles = None
 
     def checkpoint(self, which):
         """Path of the denoiser or VAE checkpoint (downloaded on first use)."""
@@ -409,29 +483,43 @@ class NoiseBandSampler:
         return self._sampler
 
     def _load_base(self):
-        """Candidate DR3 fields (and the source-property pool for the synthetic sources)."""
+        """Candidate DR3 fields and tiles (and the source-property pool for the synthetic sources)."""
         if self._base is None:
             f = dr3_fields()
-            self._base = f[f.single_ok].reset_index(drop=True)
+            self._base = f[f.single_ok & (f.native_uJy <= self.calib["fields"]["max_native_uJy"])].reset_index(drop=True)
             self._pool = snr_pool()
+            self._tiles = dr3_depth_tiles().sort_values("isl_uJy").reset_index(drop=True)
         return self._base
 
     # -- generation ---------------------------------------------------------------
+    def _pick_field(self, noise, rng):
+        """Sky position, mode and catalog depth T [uJy/beam] of an image of noise `noise`."""
+        rd = self.calib["real_depth"]
+        if noise < rd["max_noise_uJy"]:
+            isl = float(np.exp(np.interp(np.log(noise), np.log(rd["noise_p50"]), np.log(rd["isl_uJy"]))))
+            lo, hi = np.searchsorted(self._tiles.isl_uJy.values, [isl / TILE_WINDOW, isl * TILE_WINDOW])
+            t = self._tiles.iloc[int(rng.integers(lo, hi))]
+            return float(t.ra), float(t.dec), "real_depth", float(t.isl_uJy * self.calib["method"]["img_to_isl"])
+        f = self._base.iloc[int(rng.integers(len(self._base)))]
+        return float(f.ra), float(f.dec), "depth_matched", float(self.depth_for_noise(noise))
+
     def _generate(self, n, band, rng):
         """n images, noise drawn log-uniformly over the band -> images, contexts, info."""
-        fields = self._load_base()
+        self._load_base()
         method = self.calib["method"]
-        picks = fields.iloc[rng.integers(len(fields), size=n)]
+        noises = np.exp(rng.uniform(*np.log(band), size=n))
+        picks = [self._pick_field(s, rng) for s in noises]
         with ThreadPoolExecutor(4) as ex:  # a few cone searches at a time
-            raw = list(ex.map(lambda rd: fetch_field_context(*rd, CTX_SIZE), zip(picks.ra, picks.dec)))
+            raw = list(ex.map(lambda p: fetch_field_context(p[0], p[1], CTX_SIZE), picks))
         ctxs, syn, info = [], [], []
-        for (ra, dec), c in zip(zip(picks.ra, picks.dec), raw):
-            noise = float(np.exp(rng.uniform(*np.log(band))))
-            depth = float(self.depth_for_noise(noise))
-            c, s = depth_matched_context(c, depth, self._pool, rng, method)
+        for (ra, dec, mode, depth), c, noise in zip(picks, raw, noises):
+            if mode == "real_depth":
+                s = np.zeros(c.shape[1:], bool)
+            else:
+                c, s = depth_matched_context(c, depth, self._pool, rng, method)
             ctxs.append(c)
             syn.append(s)
-            info.append(dict(field_ra=float(ra), field_dec=float(dec), noise_request_uJy=noise, depth_uJy=depth))
+            info.append(dict(field_ra=ra, field_dec=dec, noise_request_uJy=float(noise), depth_uJy=depth, mode=mode))
         sampler = self._load_sampler()
         g = torch.Generator().manual_seed(int(rng.integers(2**63)))
         imgs = sampler.sample(
@@ -446,6 +534,25 @@ class NoiseBandSampler:
         imgs = imgs.cpu().numpy() if torch.is_tensor(imgs) else np.asarray(imgs)
         return imgs.reshape(n, IMAGE_SIZE, IMAGE_SIZE).astype(np.float32), ctxs, syn, info
 
+    def brightness_factors(self, truth, noise_uJy):
+        """Expected measured / input (peak, total) flux per source from its input SNR, before the image's flux factor."""
+        b = self.calib["brightness"]
+        x = np.log(np.maximum(truth.peak_flux_input.values * 1e6 / noise_uJy, b["snr"][0]))
+        return tuple(np.exp(np.interp(x, np.log(b["snr"]), np.log(b[k]))) for k in ("peak", "total"))
+
+    def _flux_factor_image(self, truth, srl, m, g_peak, inf):
+        """Flux factor of a rescaled image and its origin: from its own bright sources, else calibrated."""
+        rd = self.calib["real_depth"]
+        if len(srl) and len(truth):
+            d, j = cKDTree(srl[["x_px", "y_px"]].values).query(truth[["x_px", "y_px"]].values)
+            sel = (d < MATCH_PX) & (truth.peak_flux_input.values * 1e6 >= rd["flux_snr"] * m["noise_uJy"])
+            if sel.sum() >= rd["min_flux_sources"]:
+                expected = truth.peak_flux_input.values[sel] * g_peak[sel]
+                return float(np.median(srl.Peak_flux.values[j[sel]] / expected)), "image"
+        if inf["mode"] == "real_depth":
+            return float(m["rescale"] * np.interp(m["noise_generated_uJy"], rd["noise_p50"], rd["flux"])), "calibration"
+        return float(self.flux_factor(inf["depth_uJy"], m["noise_uJy"])), "calibration"
+
     def _judge(self, m, truth, srl, max_rescale):
         """
         Reason for rejection, or None if the image is kept (m: metrics after
@@ -459,8 +566,6 @@ class NoiseBandSampler:
         bright = truth[truth.peak_flux * 1e6 >= 10 * m["noise_uJy"]]
         if len(bright):
             if len(srl):
-                from scipy.spatial import cKDTree
-
                 d, _ = cKDTree(srl[["x_px", "y_px"]].values).query(bright[["x_px", "y_px"]].values)
                 rec = float(np.mean(d < MATCH_PX))
             else:
@@ -479,23 +584,15 @@ class NoiseBandSampler:
         band = (float(noise_min), float(noise_max))
         max_rescale = max_rescale or self.calib["criteria"]["max_rescale"]
         max_attempts = max_attempts or 5 * n + 4 * self.batch_size
+        pool = start_bdsf_pool(self.bdsf_workers, self.bdsf_nice)
         out = Path(out_dir)
         (out / "images").mkdir(parents=True, exist_ok=True)
         tmpdir = Path(tempfile.mkdtemp(prefix="bdsf_", dir=out))
         rng = np.random.default_rng(seed)
-        self.logger.info(
-            f"Generating {n} images with noise {band[0]}-{band[1]} uJy/beam "
-            f"(catalog depth {self.depth_for_noise(band[0]):.0f}-{self.depth_for_noise(band[1]):.0f})"
-        )
+        self.logger.info(f"Generating {n} images with noise {band[0]}-{band[1]} uJy/beam")
 
         kept, truths, srls, rejected = [], [], [], {}
         n_tried, t0 = 0, time.time()
-        pool = ProcessPoolExecutor(
-            max_workers=self.bdsf_workers,
-            mp_context=get_context("spawn"),
-            initializer=_worker_init,
-            initargs=(self.bdsf_nice,),
-        )
         pending = {}
         try:
             while len(kept) < n:
@@ -528,9 +625,10 @@ class NoiseBandSampler:
                         if col in srl:
                             srl[col] = srl[col] * m["rescale"]
                     truth = truth_catalog(c, s)
-                    ff = float(self.flux_factor(inf["depth_uJy"], m["noise_uJy"]))
-                    truth["peak_flux"] = truth.peak_flux_input * ff
-                    truth["total_flux"] = truth.total_flux_input * ff
+                    g_peak, g_total = self.brightness_factors(truth, m["noise_uJy"])
+                    ff, ff_from = self._flux_factor_image(truth, srl, m, g_peak, inf)
+                    truth["peak_flux"] = truth.peak_flux_input * ff * g_peak
+                    truth["total_flux"] = truth.total_flux_input * ff * g_total
                     why = self._judge(m, truth, srl, max_rescale)
                     if why is not None or len(kept) >= n:
                         rejected[why or "surplus"] = rejected.get(why or "surplus", 0) + 1
@@ -540,13 +638,15 @@ class NoiseBandSampler:
                     srl.insert(0, "image_id", k)
                     truths.append(truth)
                     srls.append(srl)
-                    kept.append(dict(image_id=k, file=f"images/img_{k:05d}.fits", **inf, flux_factor=ff, **m))
+                    kept.append(dict(image_id=k, file=f"images/img_{k:05d}.fits", **inf, flux_factor=ff, flux_factor_from=ff_from, **m))
                     write_fits(
                         img,
                         out / kept[-1]["file"],
                         NOISE=(round(m["noise_uJy"], 3), "PyBDSF median rms [uJy/beam]"),
                         RESCALE=(round(m["rescale"], 4), "factor applied to the generated image"),
                         DEPTH=(round(inf["depth_uJy"], 3), "catalog depth T [uJy/beam]"),
+                        MODE=(inf["mode"], "catalog: real_depth or depth_matched"),
+                        FLUXFAC=(round(ff, 4), f"flux factor of the image ({ff_from})"),
                         FIELDRA=(round(inf["field_ra"], 4), "DR3 field of the real sources [deg]"),
                         FIELDDEC=(round(inf["field_dec"], 4), "DR3 field of the real sources [deg]"),
                         MODEL=(self.checkpoint("denoiser").stem, "denoiser"),
@@ -561,9 +661,7 @@ class NoiseBandSampler:
             for f in pending:
                 f.cancel()
             pool.shutdown(wait=True, cancel_futures=True)
-            for f in tmpdir.glob("*"):
-                f.unlink()
-            tmpdir.rmdir()
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
         summary = pd.DataFrame(kept)
         summary.to_csv(out / "summary.csv", index=False)
