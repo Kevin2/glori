@@ -30,3 +30,5 @@ __pycache__/
 
 # PDFs
 *.pdf
+# outputs of tutorials/tutorial_noise_bands.ipynb
+noise_tutorial_output/

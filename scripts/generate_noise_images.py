@@ -5,9 +5,9 @@ Generate LOFAR-like test images in a noise band, e.g. for testing source finders
 
 Every image has a PyBDSF noise (median rms map, LoTSS settings) inside the band.
 Output in --out:
-  images/img_#####.fits   512x512, 1.5" px, 6" beam, Jy/beam (NOISE in header)
-  truth_catalog.csv       input sources (x_px, y_px, peak/total flux [Jy], Maj,
-                          synthetic or real LoTSS DR3)
+  images/img_#####.fits   512x512, 1.5" px, 6" beam, Jy/beam (NOISE, MODE in header)
+  truth_catalog.csv       input sources (x_px, y_px, peak/total flux in the image and
+                          as input [Jy], Maj, synthetic or real LoTSS DR3)
   pybdsf_catalog.csv      PyBDSF sources of each image
   summary.csv             one row per image, report.json for the whole run
 Uses one GPU and --workers single-core PyBDSF processes at low priority.

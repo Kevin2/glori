@@ -4,12 +4,14 @@ testing source finders on survey-like areas.
 
   python scripts/generate_noise_maps.py --noise 60-80 --n 8 --size 2048 --out maps_60-80
 
-The noise of a map is the median of its PyBDSF rms map (LoTSS settings); it
-varies across the map, the rms map is delivered with it. Output in --out:
+The noise of a map is the median of its PyBDSF rms map (LoTSS settings). Its slow
+drift across the map is removed by default (--no-flatten keeps it); the noise still
+rises around bright sources, so the rms map is delivered with it. Output in --out:
   maps/map_#####.fits      size x size px, 1.5" px, 6" beam, Jy/beam (NOISE in header)
   maps/map_#####_rms.fits  PyBDSF rms map of the map [Jy/beam]
-  truth_catalog.csv        input sources (map_id, x_px, y_px, peak/total flux [Jy],
-                           Maj, synthetic or real LoTSS DR3, detected by PyBDSF)
+  truth_catalog.csv        input sources (map_id, x_px, y_px, peak/total flux in the map and as input [Jy],
+                           Maj, synthetic or real LoTSS DR3, flatten_factor,
+                           detected by PyBDSF)
   pybdsf_catalog.csv       PyBDSF sources of each map
   tiles.csv                noise and texture check per 512 px tile
   summary.csv              one row per map, report.json for the whole run
@@ -37,6 +39,8 @@ def main():
     ap.add_argument("--workers", type=int, default=None,
                     help="parallel single-core PyBDSF processes (default: CPU count - 2, at most 24)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-flatten", action="store_true",
+                    help="keep the large-scale noise trend of the maps (saves one PyBDSF run per map)")
     ap.add_argument("--max-rescale", type=float, default=None,
                     help="largest factor between generated and requested noise (default: calibration)")
     args = ap.parse_args()
@@ -52,7 +56,7 @@ def main():
     except ValueError as e:
         raise SystemExit(f"error: {e}")
     report = sampler.sample(lo, hi, args.n, args.out, map_px=args.size, seed=args.seed,
-                            max_rescale=args.max_rescale)
+                            max_rescale=args.max_rescale, flatten=not args.no_flatten)
     print(f"{report['n_kept']}/{args.n} maps in {args.out} "
           f"({report['n_generated']} generated, rejected: {report['rejected']})")
 
